@@ -5,8 +5,9 @@ import time
 import secrets
 import random
 import multiprocessing
+import ctypes
 from multiprocessing import Process, Value, Lock
-import cupy as cp
+import subprocess
 import numpy as np
 
 # 目标地址
@@ -15,7 +16,6 @@ TARGET_ADDRESS = "1PWo3JeB9jrGwfHDNpdGK54CRas7fsVzXU"
 # 范围定义 (2^70 到 2^71)
 MIN_KEY = 2**70
 MAX_KEY = 2**71
-KEY_RANGE = MAX_KEY - MIN_KEY
 
 # secp256k1曲线参数
 P = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
@@ -25,65 +25,28 @@ B = 7
 Gx = 0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798
 Gy = 0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8
 
-# 将secp256k1参数转换为cupy数组
-P_cp = cp.uint64(P)
-N_cp = cp.uint64(N)
-A_cp = cp.uint64(A)
-B_cp = cp.uint64(B)
-Gx_cp = cp.uint64(Gx)
-Gy_cp = cp.uint64(Gy)
-
-def mod_inverse_gpu(a, n=P):
-    """GPU版本的扩展欧几里得算法求模逆"""
-    # 使用cupy实现模逆运算
-    # 这里使用费马小定理，因为P是质数
-    return cp.power(a, n-2, n)
-
-@cp.fuse()
-def elliptic_curve_add_gpu(point1, point2):
-    """GPU版本的椭圆曲线点加法"""
-    if point1[0] == 0 and point1[1] == 0:  # 表示无穷远点
-        return point2
-    if point2[0] == 0 and point2[1] == 0:  # 表示无穷远点
-        return point1
+# 加载CUDA共享库
+try:
+    cuda_lib = ctypes.CDLL('./cuda_secp256k1.so')
     
-    x1, y1 = point1
-    x2, y2 = point2
+    # 定义函数原型
+    cuda_lib.gpu_batch_compute_public_keys.argtypes = [
+        ctypes.POINTER(ctypes.c_ulonglong),  # private_keys
+        ctypes.c_int,                        # batch_size
+        ctypes.POINTER(ctypes.c_ulonglong),  # public_keys_x
+        ctypes.POINTER(ctypes.c_ulonglong),  # public_keys_y
+        ctypes.c_int                         # gpu_id
+    ]
+    cuda_lib.gpu_batch_compute_public_keys.restype = ctypes.c_int
     
-    if x1 == x2:
-        if y1 != y2:
-            return cp.array([0, 0], dtype=cp.uint64)  # 无穷远点
-        else:
-            # 点加倍
-            s = (3 * x1 * x1 + A_cp) * mod_inverse_gpu(2 * y1, P_cp) % P_cp
-    else:
-        # 点相加
-        s = (y2 - y1) * mod_inverse_gpu(x2 - x1, P_cp) % P_cp
+    cuda_lib.get_gpu_count.argtypes = []
+    cuda_lib.get_gpu_count.restype = ctypes.c_int
     
-    x3 = (s * s - x1 - x2) % P_cp
-    y3 = (s * (x1 - x3) - y1) % P_cp
-    
-    return cp.array([x3, y3], dtype=cp.uint64)
-
-def elliptic_curve_multiply_gpu(k, point):
-    """GPU版本的椭圆曲线标量乘法"""
-    if k == 0:
-        return cp.array([0, 0], dtype=cp.uint64)
-    if k == 1:
-        return point
-    
-    # 使用二进制展开法
-    result = cp.array([0, 0], dtype=cp.uint64)  # 无穷远点
-    addend = point.copy()
-    
-    k_val = k
-    while k_val > 0:
-        if k_val & 1:
-            result = elliptic_curve_add_gpu(result, addend)
-        addend = elliptic_curve_add_gpu(addend, addend)
-        k_val >>= 1
-    
-    return result
+    CUDA_AVAILABLE = True
+    print(f"CUDA库加载成功，检测到 {cuda_lib.get_gpu_count()} 个GPU")
+except Exception as e:
+    print(f"CUDA库加载失败: {e}")
+    CUDA_AVAILABLE = False
 
 def private_key_to_wif_compressed(private_key_int):
     """将整数私钥转换为WIF压缩格式"""
@@ -121,25 +84,14 @@ def private_key_to_wif_compressed(private_key_int):
     except Exception as e:
         return None
 
-def private_key_to_compressed_address(private_key_int):
-    """从私钥生成压缩格式比特币地址"""
+def public_key_to_compressed_address(public_key_x, public_key_y):
+    """从公钥坐标生成压缩格式比特币地址"""
     try:
-        # 验证私钥范围
-        if private_key_int <= 0 or private_key_int >= N:
-            return None
-        
-        # 计算公钥点
-        public_key_point = elliptic_curve_multiply_gpu(private_key_int, cp.array([Gx, Gy], dtype=cp.uint64))
-        if public_key_point[0] == 0 and public_key_point[1] == 0:
-            return None
-            
-        x, y = public_key_point.get()  # 将结果转回CPU
-        
         # 压缩公钥格式 (02 或 03 + x坐标)
-        if y % 2 == 0:
-            compressed_public_key = b'\x02' + int(x).to_bytes(32, 'big')
+        if public_key_y % 2 == 0:
+            compressed_public_key = b'\x02' + public_key_x.to_bytes(32, 'big')
         else:
-            compressed_public_key = b'\x03' + int(x).to_bytes(32, 'big')
+            compressed_public_key = b'\x03' + public_key_x.to_bytes(32, 'big')
         
         # SHA256哈希
         sha256_hash = hashlib.sha256(compressed_public_key).digest()
@@ -166,84 +118,111 @@ def private_key_to_compressed_address(private_key_int):
     except Exception as e:
         return None
 
-def gpu_batch_generate_and_check(batch_size, target_address, found_flag, keys_checked_counter):
-    """GPU批量生成和检查私钥"""
-    # 在GPU上生成随机私钥
-    private_keys_gpu = cp.random.randint(MIN_KEY, MAX_KEY, batch_size, dtype=cp.uint64)
-    
-    # 过滤有效私钥（在secp256k1曲线范围内）
-    valid_mask = (private_keys_gpu > 0) & (private_keys_gpu < N_cp)
-    valid_private_keys = private_keys_gpu[valid_mask]
-    
-    if len(valid_private_keys) == 0:
+def generate_batch_private_keys(batch_size):
+    """生成一批有效的私钥"""
+    private_keys = []
+    for _ in range(batch_size):
+        while True:
+            try:
+                # 在指定范围内生成随机私钥
+                private_key_int = secrets.randbelow(MAX_KEY - MIN_KEY) + MIN_KEY
+                
+                # 确保私钥在有效范围内
+                if 1 <= private_key_int < N:
+                    private_keys.append(private_key_int)
+                    break
+            except Exception:
+                continue
+    return private_keys
+
+def gpu_process_batch(worker_id, batch_size, found_flag, keys_checked_counter):
+    """使用GPU处理一批私钥"""
+    if not CUDA_AVAILABLE:
         return False, None
     
-    # 批量计算地址（这里简化处理，实际应该优化为批量计算）
-    for i in range(len(valid_private_keys)):
-        if found_flag.value:
-            break
+    try:
+        # 生成私钥
+        private_keys = generate_batch_private_keys(batch_size)
+        
+        # 转换为C类型数组
+        private_keys_c = (ctypes.c_ulonglong * batch_size)()
+        public_keys_x_c = (ctypes.c_ulonglong * batch_size)()
+        public_keys_y_c = (ctypes.c_ulonglong * batch_size)()
+        
+        for i, key in enumerate(private_keys):
+            private_keys_c[i] = key
+        
+        # 调用CUDA函数
+        result = cuda_lib.gpu_batch_compute_public_keys(
+            private_keys_c, batch_size, public_keys_x_c, public_keys_y_c, worker_id
+        )
+        
+        if result != 0:
+            print(f"GPU进程 {worker_id}: CUDA计算错误")
+            return False, None
+        
+        # 检查每个地址
+        for i in range(batch_size):
+            if found_flag.value:
+                break
+                
+            public_key_x = public_keys_x_c[i]
+            public_key_y = public_keys_y_c[i]
             
-        private_key_int = int(valid_private_keys[i])
-        address = private_key_to_compressed_address(private_key_int)
+            # 跳过无效的公钥点
+            if public_key_x == 0 and public_key_y == 0:
+                continue
+            
+            address = public_key_to_compressed_address(public_key_x, public_key_y)
+            
+            if address and address == TARGET_ADDRESS:
+                return True, private_keys[i]
+            
+            keys_checked_counter.value += 1
         
-        keys_checked_counter.value += 1
+        return False, None
         
-        if address == target_address:
-            return True, private_key_int
-    
-    return False, None
+    except Exception as e:
+        print(f"GPU进程 {worker_id} 错误: {e}")
+        return False, None
 
 def worker_gpu(worker_id, keys_checked_counter, found_flag, start_time, lock):
     """GPU工作进程函数"""
     print(f"GPU进程 {worker_id} 启动")
     
-    # 设置GPU设备
-    try:
-        cp.cuda.Device(worker_id % cp.cuda.runtime.getDeviceCount()).use()
-        print(f"进程 {worker_id} 使用 GPU {worker_id % cp.cuda.runtime.getDeviceCount()}")
-    except:
-        print(f"进程 {worker_id} 使用默认GPU")
-    
-    batch_size = 10000  # GPU可以处理更大的批次
+    batch_size = 10000  # 每批处理的私钥数量
     
     while not found_flag.value:
-        try:
-            found, private_key = gpu_batch_generate_and_check(
-                batch_size, TARGET_ADDRESS, found_flag, keys_checked_counter
-            )
-            
-            if found:
-                print(f"\n🎉 GPU进程 {worker_id} 找到匹配的地址! 🎉")
-                print(f"目标地址: {TARGET_ADDRESS}")
-                wif = private_key_to_wif_compressed(private_key)
-                if wif:
-                    print(f"WIF压缩格式私钥: {wif}")
-                    print(f"私钥(十六进制): {format(private_key, '064x')}")
-                    
-                    # 保存到文件
-                    with lock:
-                        with open(f"found_key_gpu_{worker_id}.txt", "w") as f:
-                            f.write(f"目标地址: {TARGET_ADDRESS}\n")
-                            f.write(f"WIF压缩格式私钥: {wif}\n")
-                            f.write(f"私钥(十六进制): {format(private_key, '064x')}\n")
-                            f.write(f"发现时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-                            f.write(f"工作进程: {worker_id}\n")
-                            f.write(f"使用设备: GPU\n")
-                    
-                    found_flag.value = 1
-                    return
+        found, private_key = gpu_process_batch(worker_id, batch_size, found_flag, keys_checked_counter)
         
-        except Exception as e:
-            print(f"GPU进程 {worker_id} 错误: {e}")
-            continue
+        if found:
+            print(f"\n🎉 GPU进程 {worker_id} 找到匹配的地址! 🎉")
+            print(f"目标地址: {TARGET_ADDRESS}")
+            wif = private_key_to_wif_compressed(private_key)
+            if wif:
+                print(f"WIF压缩格式私钥: {wif}")
+                print(f"私钥(十六进制): {format(private_key, '064x')}")
+                
+                # 保存到文件
+                with lock:
+                    with open(f"found_key_gpu_{worker_id}.txt", "w") as f:
+                        f.write(f"目标地址: {TARGET_ADDRESS}\n")
+                        f.write(f"WIF压缩格式私钥: {wif}\n")
+                        f.write(f"私钥(十六进制): {format(private_key, '064x')}\n")
+                        f.write(f"发现时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                        f.write(f"工作进程: {worker_id}\n")
+                        f.write(f"使用设备: GPU\n")
+                
+                found_flag.value = 1
+                return
         
         # 定期显示进度
-        if keys_checked_counter.value % 100000 == 0:
+        current_count = keys_checked_counter.value
+        if current_count % 100000 == 0:
             elapsed_time = time.time() - start_time.value
-            total_keys = keys_checked_counter.value
-            keys_per_second = total_keys / elapsed_time if elapsed_time > 0 else 0
+            keys_per_second = current_count / elapsed_time if elapsed_time > 0 else 0
             
-            print(f"GPU进程 {worker_id}: 已检查 {total_keys:,} 个密钥, "
+            print(f"GPU进程 {worker_id}: 已检查 {current_count:,} 个密钥, "
                   f"速度: {keys_per_second:,.0f} 密钥/秒")
 
 def monitor_progress(keys_checked_counter, found_flag, start_time):
@@ -263,27 +242,34 @@ def monitor_progress(keys_checked_counter, found_flag, start_time):
         print("==================\n")
 
 def main():
-    print("=== 比特币私钥碰撞程序 (GPU版本) ===")
+    print("=== 比特币私钥碰撞程序 (GPU CUDA版本) ===")
     print(f"目标地址: {TARGET_ADDRESS}")
     print(f"搜索范围: 2^70 到 2^71")
     print(f"密钥格式: 压缩格式")
     
-    # 显示GPU信息
+    if not CUDA_AVAILABLE:
+        print("错误: CUDA不可用，请确保CUDA库已正确编译")
+        return
+    
+    # 编译CUDA代码
+    print("编译CUDA代码...")
     try:
-        gpu_count = cp.cuda.runtime.getDeviceCount()
-        print(f"检测到 {gpu_count} 个GPU设备")
-        for i in range(gpu_count):
-            props = cp.cuda.runtime.getDeviceProperties(i)
-            print(f"GPU {i}: {props['name'].decode()}")
+        subprocess.run(["nvcc", "-shared", "-o", "cuda_secp256k1.so", 
+                       "-Xcompiler", "-fPIC", "cuda_secp256k1.cu", 
+                       "-arch=sm_60"], check=True)
+        print("CUDA代码编译成功")
     except Exception as e:
-        print(f"GPU信息获取失败: {e}")
-        gpu_count = 1
+        print(f"CUDA编译失败: {e}")
+        return
     
-    print("=" * 50)
+    # 获取GPU数量
+    gpu_count = cuda_lib.get_gpu_count()
+    print(f"检测到 {gpu_count} 个GPU设备")
     
-    # 使用GPU数量或CPU核心数
+    # 使用GPU数量
     num_processes = min(gpu_count, multiprocessing.cpu_count())
     print(f"使用 {num_processes} 个进程")
+    print("=" * 50)
     
     # 共享变量
     keys_checked_counter = Value('i', 0)
@@ -304,7 +290,7 @@ def main():
                    args=(i, keys_checked_counter, found_flag, start_time, lock))
         processes.append(p)
         p.start()
-        time.sleep(0.5)  # 避免所有进程同时启动
+        time.sleep(1)  # 避免所有进程同时启动
     
     # 等待所有进程完成
     try:
