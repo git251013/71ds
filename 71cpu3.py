@@ -1,396 +1,286 @@
-#include <iostream>
-#include <vector>
-#include <thread>
-#include <atomic>
-#include <mutex>
-#include <chrono>
-#include <iomanip>
-#include <fstream>
-#include <openssl/sha.h>
-#include <openssl/ripemd.h>
-#include <openssl/ec.h>
-#include <openssl/bn.h>
-#include <openssl/obj_mac.h>
+#!/usr/bin/env python3
+"""
+比特币私钥碰撞工具 - 多进程CPU优化版本
+目标地址: 1PWo3JeB9jrGwfHDNpdGK54CRas7fsVzXU
+搜索范围: 2^70 到 2^71 (压缩格式私钥)
+"""
 
-// Target address
-const std::string TARGET_ADDRESS = "1PWo3JeB9jrGwfHDNpdGK54CRas7fsVzXU";
+import os
+import sys
+import time
+import hashlib
+import multiprocessing as mp
+from multiprocessing import Pool, Manager, Value, Lock
+import secrets
+import base58
+import ecdsa
+from ecdsa.curves import SECP256k1
+from ecdsa.ecdsa import curve_secp256k1
+from ecdsa.numbertheory import inverse_mod
+import threading
 
-// secp256k1 curve order
-const char* SECP256K1_ORDER_HEX = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141";
+# 常量定义
+TARGET_ADDRESS = "1PWo3JeB9jrGwfHDNpdGK54CRas7fsVzXU"
+START_RANGE = 2**70
+END_RANGE = 2**71
+CPU_COUNT = mp.cpu_count()
+BATCH_SIZE = 1000  # 每批处理的密钥数量
 
-// Base58 characters
-const char* BASE58_CHARS = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-
-// Global variables
-std::atomic<bool> found(false);
-std::atomic<uint64_t> keys_checked(0);
-std::mutex output_mutex;
-
-// Base58 encoding
-std::string base58_encode(const std::vector<unsigned char>& data) {
-    if (data.empty()) return "";
-    
-    // Count leading zeros
-    size_t zero_count = 0;
-    while (zero_count < data.size() && data[zero_count] == 0) {
-        zero_count++;
-    }
-    
-    // Convert to Base58
-    std::vector<unsigned char> digits;
-    digits.resize(data.size() * 2);
-    size_t digitslen = 1;
-    
-    for (size_t i = zero_count; i < data.size(); i++) {
-        uint32_t carry = static_cast<uint32_t>(data[i]);
+class BitcoinKeyGenerator:
+    def __init__(self):
+        self.curve = SECP256k1
+        self.G = self.curve.generator
+        self.p = self.curve.curve.p()
+        self.n = self.curve.order
         
-        for (size_t j = 0; j < digitslen; j++) {
-            carry += static_cast<uint32_t>(digits[j]) << 8;
-            digits[j] = static_cast<unsigned char>(carry % 58);
-            carry /= 58;
-        }
+    def private_key_to_compressed_wif(self, private_key_int):
+        """将私钥整数转换为WIF压缩格式"""
+        # 添加版本字节(0x80)和压缩标志(0x01)
+        private_key_bytes = private_key_int.to_bytes(32, 'big')
+        extended_key = b'\x80' + private_key_bytes + b'\x01'
         
-        while (carry > 0) {
-            digits[digitslen++] = static_cast<unsigned char>(carry % 58);
-            carry /= 58;
-        }
-    }
+        # 双重SHA256哈希
+        first_sha = hashlib.sha256(extended_key).digest()
+        checksum = hashlib.sha256(first_sha).digest()[:4]
+        
+        # Base58编码
+        wif = base58.b58encode(extended_key + checksum)
+        return wif.decode('utf-8')
     
-    // Build result string
-    std::string result;
-    result.reserve(zero_count + digitslen);
-    
-    // Add leading zeros
-    for (size_t i = 0; i < zero_count; i++) {
-        result.push_back(BASE58_CHARS[0]);
-    }
-    
-    // Add Base58 digits
-    for (size_t i = 0; i < digitslen; i++) {
-        result.push_back(BASE58_CHARS[digits[digitslen - 1 - i]]);
-    }
-    
-    return result;
-}
+    def private_key_to_compressed_address(self, private_key_int):
+        """从私钥生成压缩格式比特币地址"""
+        try:
+            # 使用ecdsa库生成公钥
+            private_key_bytes = private_key_int.to_bytes(32, 'big')
+            sk = ecdsa.SigningKey.from_string(private_key_bytes, curve=SECP256k1)
+            vk = sk.get_verifying_key()
+            
+            # 压缩公钥格式
+            public_key_bytes = vk.to_string("compressed")
+            
+            # SHA256哈希
+            sha256_hash = hashlib.sha256(public_key_bytes).digest()
+            
+            # RIPEMD160哈希
+            ripemd160_hash = hashlib.new('ripemd160', sha256_hash).digest()
+            
+            # 添加版本字节 (0x00 用于主网)
+            versioned_payload = b'\x00' + ripemd160_hash
+            
+            # 计算校验和
+            checksum = hashlib.sha256(hashlib.sha256(versioned_payload).digest()).digest()[:4]
+            
+            # Base58编码
+            binary_address = versioned_payload + checksum
+            bitcoin_address = base58.b58encode(binary_address)
+            
+            return bitcoin_address.decode('utf-8')
+            
+        except Exception as e:
+            return None
 
-// Check if private key is valid
-bool is_valid_private_key(const BIGNUM* private_key, const BIGNUM* curve_order) {
-    if (BN_is_zero(private_key)) return false;
-    if (BN_cmp(private_key, curve_order) >= 0) return false;
-    return true;
-}
-
-// Convert private key to WIF compressed format
-std::string private_key_to_wif_compressed(const BIGNUM* private_key) {
-    if (!private_key) return "";
-    
-    std::vector<unsigned char> private_key_bytes(32);
-    if (BN_bn2binpad(private_key, private_key_bytes.data(), 32) != 32) {
-        return "";
-    }
-    
-    std::vector<unsigned char> wif_bytes;
-    wif_bytes.reserve(38);
-    
-    wif_bytes.push_back(0x80);
-    wif_bytes.insert(wif_bytes.end(), private_key_bytes.begin(), private_key_bytes.end());
-    wif_bytes.push_back(0x01);
-    
-    unsigned char hash1[SHA256_DIGEST_LENGTH];
-    unsigned char hash2[SHA256_DIGEST_LENGTH];
-    
-    SHA256(wif_bytes.data(), wif_bytes.size(), hash1);
-    SHA256(hash1, SHA256_DIGEST_LENGTH, hash2);
-    
-    wif_bytes.insert(wif_bytes.end(), hash2, hash2 + 4);
-    
-    return base58_encode(wif_bytes);
-}
-
-// Generate compressed Bitcoin address from private key
-std::string private_key_to_compressed_address(const BIGNUM* private_key, const BIGNUM* curve_order) {
-    if (!private_key || !is_valid_private_key(private_key, curve_order)) {
-        return "";
-    }
-    
-    EC_KEY* ec_key = EC_KEY_new_by_curve_name(NID_secp256k1);
-    if (!ec_key) return "";
-    
-    if (EC_KEY_set_private_key(ec_key, private_key) != 1) {
-        EC_KEY_free(ec_key);
-        return "";
-    }
-    
-    const EC_GROUP* group = EC_KEY_get0_group(ec_key);
-    EC_POINT* public_point = EC_POINT_new(group);
-    if (!public_point) {
-        EC_KEY_free(ec_key);
-        return "";
-    }
-    
-    BN_CTX* ctx = BN_CTX_new();
-    if (!ctx) {
-        EC_POINT_free(public_point);
-        EC_KEY_free(ec_key);
-        return "";
-    }
-    
-    std::string result;
-    
-    if (EC_POINT_mul(group, public_point, private_key, NULL, NULL, ctx) == 1) {
-        BIGNUM* x = BN_new();
-        BIGNUM* y = BN_new();
+class OptimizedKeySearcher:
+    def __init__(self, target_address, start_range, end_range):
+        self.target_address = target_address
+        self.start_range = start_range
+        self.end_range = end_range
+        self.range_size = end_range - start_range
+        self.key_gen = BitcoinKeyGenerator()
+        self.found_flag = Value('b', False)
+        self.keys_tested = Value('Q', 0)  # 无符号长整型
+        self.lock = Lock()
         
-        if (x && y && EC_POINT_get_affine_coordinates(group, public_point, x, y, ctx) == 1) {
-            std::vector<unsigned char> public_key;
-            public_key.reserve(33);
-            
-            public_key.push_back(BN_is_odd(y) ? 0x03 : 0x02);
-            
-            std::vector<unsigned char> x_bytes(32);
-            BN_bn2binpad(x, x_bytes.data(), 32);
-            public_key.insert(public_key.end(), x_bytes.begin(), x_bytes.end());
-            
-            unsigned char sha256_hash[SHA256_DIGEST_LENGTH];
-            SHA256(public_key.data(), public_key.size(), sha256_hash);
-            
-            unsigned char ripemd160_hash[RIPEMD160_DIGEST_LENGTH];
-            RIPEMD160(sha256_hash, SHA256_DIGEST_LENGTH, ripemd160_hash);
-            
-            std::vector<unsigned char> address_bytes;
-            address_bytes.reserve(25);
-            
-            address_bytes.push_back(0x00);
-            address_bytes.insert(address_bytes.end(), ripemd160_hash, ripemd160_hash + 20);
-            
-            unsigned char checksum1[SHA256_DIGEST_LENGTH];
-            unsigned char checksum2[SHA256_DIGEST_LENGTH];
-            
-            SHA256(address_bytes.data(), address_bytes.size(), checksum1);
-            SHA256(checksum1, SHA256_DIGEST_LENGTH, checksum2);
-            
-            address_bytes.insert(address_bytes.end(), checksum2, checksum2 + 4);
-            
-            result = base58_encode(address_bytes);
-        }
+    def generate_secure_random_keys(self, count):
+        """生成密码学安全的随机私钥"""
+        keys = []
+        for _ in range(count):
+            # 在指定范围内生成随机私钥
+            key_int = secrets.randbelow(self.range_size) + self.start_range
+            keys.append(key_int)
+        return keys
+    
+    def worker_process(self, process_id, results_queue):
+        """工作进程函数"""
+        print(f"进程 {process_id} 启动，搜索范围: {self.start_range} - {self.end_range}")
         
-        if (x) BN_free(x);
-        if (y) BN_free(y);
-    }
-    
-    BN_CTX_free(ctx);
-    EC_POINT_free(public_point);
-    EC_KEY_free(ec_key);
-    
-    return result;
-}
-
-// Generate valid private key in range
-bool generate_private_key_in_range(BIGNUM* result, const BIGNUM* min_key, const BIGNUM* max_key, 
-                                  const BIGNUM* curve_order, BN_CTX* ctx) {
-    if (!result || !min_key || !max_key || !curve_order || !ctx) return false;
-    
-    BIGNUM* range = BN_CTX_get(ctx);
-    BIGNUM* temp = BN_CTX_get(ctx);
-    if (!range || !temp) return false;
-    
-    if (BN_sub(range, max_key, min_key) != 1) return false;
-    if (BN_rand_range(temp, range) != 1) return false;
-    if (BN_add(result, min_key, temp) != 1) return false;
-    
-    return is_valid_private_key(result, curve_order);
-}
-
-// Worker thread function
-void worker_thread(int thread_id, const BIGNUM* min_key, const BIGNUM* max_key, 
-                  const BIGNUM* curve_order) {
-    BN_CTX* ctx = BN_CTX_new();
-    if (!ctx) return;
-    
-    BIGNUM* private_key = BN_new();
-    if (!private_key) {
-        BN_CTX_free(ctx);
-        return;
-    }
-    
-    uint64_t local_count = 0;
-    auto last_report = std::chrono::steady_clock::now();
-    
-    while (!found) {
-        if (!generate_private_key_in_range(private_key, min_key, max_key, curve_order, ctx)) {
-            continue;
-        }
+        keys_tested_local = 0
+        start_time = time.time()
         
-        std::string address = private_key_to_compressed_address(private_key, curve_order);
-        if (address.empty()) {
-            continue;
-        }
-        
-        local_count++;
-        
-        if (address == TARGET_ADDRESS) {
-            std::lock_guard<std::mutex> lock(output_mutex);
-            std::cout << "\n*** FOUND MATCHING ADDRESS! ***" << std::endl;
-            std::cout << "Target: " << TARGET_ADDRESS << std::endl;
+        while not self.found_flag.value:
+            # 批量生成密钥以提高效率
+            batch_keys = self.generate_secure_random_keys(BATCH_SIZE)
             
-            std::string wif = private_key_to_wif_compressed(private_key);
-            std::cout << "WIF: " << wif << std::endl;
-            
-            char* hex_key = BN_bn2hex(private_key);
-            if (hex_key) {
-                std::cout << "Private Key (hex): " << hex_key << std::endl;
-                
-                std::ofstream file("found_key.txt");
-                if (file.is_open()) {
-                    auto now = std::chrono::system_clock::now();
-                    std::time_t time = std::chrono::system_clock::to_time_t(now);
+            for private_key_int in batch_keys:
+                if self.found_flag.value:
+                    break
                     
-                    file << "Target: " << TARGET_ADDRESS << "\n";
-                    file << "WIF: " << wif << "\n";
-                    file << "Private Key: " << hex_key << "\n";
-                    file << "Time: " << std::ctime(&time);
-                    file << "Thread: " << thread_id << "\n";
-                    file.close();
-                }
-                
-                OPENSSL_free(hex_key);
-            }
+                try:
+                    # 生成压缩地址
+                    address = self.key_gen.private_key_to_compressed_address(private_key_int)
+                    keys_tested_local += 1
+                    
+                    if keys_tested_local % 10000 == 0:
+                        elapsed = time.time() - start_time
+                        rate = keys_tested_local / elapsed if elapsed > 0 else 0
+                        print(f"进程 {process_id}: 已测试 {keys_tested_local} 个密钥, 速率: {rate:.2f} 密钥/秒")
+                    
+                    if address and address == self.target_address:
+                        print(f"\n*** 找到匹配的地址! ***")
+                        print(f"目标地址: {self.target_address}")
+                        print(f"找到的地址: {address}")
+                        
+                        # 获取WIF压缩格式私钥
+                        wif_compressed = self.key_gen.private_key_to_compressed_wif(private_key_int)
+                        print(f"WIF压缩私钥: {wif_compressed}")
+                        print(f"私钥 (十进制): {private_key_int}")
+                        print(f"私钥 (十六进制): {hex(private_key_int)}")
+                        
+                        # 保存结果到文件
+                        with open("found_private_key.txt", "w") as f:
+                            f.write(f"目标地址: {self.target_address}\n")
+                            f.write(f"WIF压缩私钥: {wif_compressed}\n")
+                            f.write(f"私钥 (十进制): {private_key_int}\n")
+                            f.write(f"私钥 (十六进制): {hex(private_key_int)}\n")
+                        
+                        with self.lock:
+                            self.found_flag.value = True
+                            self.keys_tested.value += keys_tested_local
+                        
+                        results_queue.put({
+                            'process_id': process_id,
+                            'private_key': private_key_int,
+                            'wif_compressed': wif_compressed,
+                            'keys_tested': keys_tested_local,
+                            'address': address
+                        })
+                        return
+                        
+                except Exception as e:
+                    continue
             
-            found = true;
-            break;
-        }
+            # 定期更新全局计数器
+            if keys_tested_local % 1000 == 0:
+                with self.lock:
+                    self.keys_tested.value += 1000
         
-        auto now = std::chrono::steady_clock::now();
-        if (now - last_report > std::chrono::seconds(5)) {
-            keys_checked += local_count;
-            local_count = 0;
-            last_report = now;
-        }
-    }
-    
-    keys_checked += local_count;
-    BN_free(private_key);
-    BN_CTX_free(ctx);
-}
+        # 进程结束时的统计
+        with self.lock:
+            self.keys_tested.value += keys_tested_local % 1000
+        
+        print(f"进程 {process_id} 结束, 测试了 {keys_tested_local} 个密钥")
 
-// Progress monitor
-void progress_monitor() {
-    auto start_time = std::chrono::steady_clock::now();
-    uint64_t last_count = 0;
-    auto last_time = start_time;
-    
-    while (!found) {
-        std::this_thread::sleep_for(std::chrono::seconds(5));
+    def start_search(self, num_processes=None):
+        """启动多进程搜索"""
+        if num_processes is None:
+            num_processes = CPU_COUNT
+            
+        print(f"开始搜索比特币私钥...")
+        print(f"目标地址: {self.target_address}")
+        print(f"搜索范围: {self.start_range} 到 {self.end_range}")
+        print(f"使用进程数: {num_processes}")
+        print(f"每批处理密钥数: {BATCH_SIZE}")
+        print(f"总搜索空间: {self.range_size:,} 个密钥")
+        print("-" * 60)
         
-        auto current_time = std::chrono::steady_clock::now();
-        uint64_t current_count = keys_checked.load();
-        double elapsed = std::chrono::duration<double>(current_time - start_time).count();
+        start_time = time.time()
         
-        double avg_speed = (elapsed > 0) ? current_count / elapsed : 0;
-        double time_diff = std::chrono::duration<double>(current_time - last_time).count();
-        double instant_speed = (time_diff > 0) ? (current_count - last_count) / time_diff : 0;
-        
-        std::cout << "\n=== Progress ===" << std::endl;
-        std::cout << "Time: " << std::fixed << std::setprecision(1) << elapsed << "s" << std::endl;
-        std::cout << "Keys: " << current_count << std::endl;
-        std::cout << "Speed: " << std::fixed << std::setprecision(0) << avg_speed << "/s" << std::endl;
-        std::cout << "Current: " << std::fixed << std::setprecision(0) << instant_speed << "/s" << std::endl;
-        std::cout << "================\n" << std::endl;
-        
-        last_count = current_count;
-        last_time = current_time;
-    }
-}
+        # 创建进程池
+        with Manager() as manager:
+            results_queue = manager.Queue()
+            processes = []
+            
+            # 启动工作进程
+            for i in range(num_processes):
+                p = mp.Process(target=self.worker_process, args=(i, results_queue))
+                processes.append(p)
+                p.start()
+            
+            # 监控进程
+            try:
+                while any(p.is_alive() for p in processes):
+                    time.sleep(5)
+                    elapsed = time.time() - start_time
+                    total_tested = self.keys_tested.value
+                    
+                    if elapsed > 0:
+                        rate = total_tested / elapsed
+                        print(f"\r总进度: {total_tested:,} 密钥测试, "
+                              f"速率: {rate:,.0f} 密钥/秒, "
+                              f"运行时间: {elapsed:.1f}秒", end="")
+                    
+                    # 检查是否有结果
+                    if not results_queue.empty():
+                        result = results_queue.get()
+                        print(f"\n\n*** 成功找到私钥! ***")
+                        print(f"进程 {result['process_id']} 找到匹配")
+                        print(f"WIF压缩私钥: {result['wif_compressed']}")
+                        
+                        # 终止所有进程
+                        for p in processes:
+                            if p.is_alive():
+                                p.terminate()
+                        break
+                        
+            except KeyboardInterrupt:
+                print(f"\n用户中断搜索...")
+                for p in processes:
+                    if p.is_alive():
+                        p.terminate()
+            
+            # 等待所有进程结束
+            for p in processes:
+                p.join()
+            
+            total_time = time.time() - start_time
+            print(f"\n\n搜索结束!")
+            print(f"总测试密钥数: {self.keys_tested.value:,}")
+            print(f"总运行时间: {total_time:.2f} 秒")
+            print(f"平均速率: {self.keys_tested.value/total_time:,.0f} 密钥/秒" if total_time > 0 else "N/A")
 
-int main() {
-    std::cout << "=== Bitcoin Private Key Brute Force ===" << std::endl;
-    std::cout << "Target: " << TARGET_ADDRESS << std::endl;
-    std::cout << "Range: 2^70 to 2^71" << std::endl;
-    std::cout << "=====================================" << std::endl;
+def main():
+    """主函数"""
+    print("比特币私钥碰撞工具 - 多进程优化版")
+    print("=" * 60)
     
-    // Initialize OpenSSL
-    OpenSSL_add_all_algorithms();
+    # 初始化搜索器
+    searcher = OptimizedKeySearcher(TARGET_ADDRESS, START_RANGE, END_RANGE)
     
-    // Create curve order
-    BIGNUM* curve_order = BN_new();
-    if (!curve_order || BN_hex2bn(&curve_order, SECP256K1_ORDER_HEX) == 0) {
-        std::cerr << "Error: Failed to create curve order" << std::endl;
-        if (curve_order) BN_free(curve_order);
-        return 1;
-    }
+    # 计算概率
+    total_space = END_RANGE - START_RANGE
+    print(f"搜索空间大小: {total_space:,} 个可能的私钥")
+    print(f"成功概率: 约 {1/total_space:.10e}")
+    print(f"注意: 这是一个极大的搜索空间，找到匹配密钥的概率极低")
+    print("=" * 60)
     
-    // Create search range using BN_set_bit
-    BIGNUM* min_key = BN_new();
-    BIGNUM* max_key = BN_new();
+    # 确认开始
+    response = input("是否开始搜索? (y/N): ").lower().strip()
+    if response not in ['y', 'yes']:
+        print("搜索已取消")
+        return
     
-    if (!min_key || !max_key) {
-        std::cerr << "Error: Failed to create range keys" << std::endl;
-        BN_free(curve_order);
-        if (min_key) BN_free(min_key);
-        if (max_key) BN_free(max_key);
-        return 1;
-    }
+    # 启动搜索
+    try:
+        searcher.start_search()
+    except Exception as e:
+        print(f"错误: {e}")
+        import traceback
+        traceback.print_exc()
+
+if __name__ == "__main__":
+    # 设置多进程启动方法
+    if sys.platform.startswith('win'):
+        mp.set_start_method('spawn')
+    else:
+        mp.set_start_method('fork')
     
-    // Set 2^70 and 2^71 using BN_set_bit
-    BN_zero(min_key);
-    BN_set_bit(min_key, 70);  // 2^70
+    # 检查依赖
+    try:
+        import base58
+        import ecdsa
+        import secrets
+    except ImportError as e:
+        print(f"缺少依赖库: {e}")
+        print("请安装所需库: pip install base58 ecdsa")
+        sys.exit(1)
     
-    BN_zero(max_key);
-    BN_set_bit(max_key, 71);  // 2^71
-    
-    // Verify range
-    if (BN_cmp(min_key, max_key) >= 0) {
-        std::cerr << "Error: Invalid range" << std::endl;
-        BN_free(curve_order);
-        BN_free(min_key);
-        BN_free(max_key);
-        return 1;
-    }
-    
-    // Determine thread count
-    unsigned int num_threads = std::thread::hardware_concurrency();
-    if (num_threads == 0) num_threads = 4;
-    if (num_threads > 16) num_threads = 16;
-    
-    std::cout << "Using " << num_threads << " threads" << std::endl;
-    
-    auto start_time = std::chrono::steady_clock::now();
-    
-    // Start monitor thread
-    std::thread monitor(progress_monitor);
-    
-    // Start worker threads
-    std::vector<std::thread> workers;
-    for (unsigned int i = 0; i < num_threads; i++) {
-        workers.emplace_back(worker_thread, i, min_key, max_key, curve_order);
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-    
-    // Wait for workers
-    for (auto& thread : workers) {
-        if (thread.joinable()) thread.join();
-    }
-    
-    // Wait for monitor
-    if (monitor.joinable()) monitor.join();
-    
-    auto end_time = std::chrono::steady_clock::now();
-    double total_time = std::chrono::duration<double>(end_time - start_time).count();
-    
-    std::cout << "\nFinished" << std::endl;
-    std::cout << "Total time: " << total_time << "s" << std::endl;
-    std::cout << "Total keys: " << keys_checked.load() << std::endl;
-    
-    if (total_time > 0) {
-        std::cout << "Average speed: " << keys_checked.load() / total_time << "/s" << std::endl;
-    }
-    
-    // Cleanup
-    BN_free(curve_order);
-    BN_free(min_key);
-    BN_free(max_key);
-    
-    EVP_cleanup();
-    
-    return 0;
-}
+    main()
