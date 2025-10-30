@@ -17,8 +17,9 @@
 const std::string TARGET_ADDRESS = "1PWo3JeB9jrGwfHDNpdGK54CRas7fsVzXU";
 
 // 范围定义 (2^70 到 2^71)
-constexpr uint64_t MIN_KEY = 1ULL << 70;
-constexpr uint64_t MAX_KEY = 1ULL << 71;
+// 使用字符串初始化大数，避免位移溢出
+const char* MIN_KEY_STR = "1180591620717411303424";  // 2^70
+const char* MAX_KEY_STR = "2361183241434822606848";  // 2^71
 
 // Base58字符集
 const char* BASE58_CHARS = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
@@ -163,12 +164,26 @@ std::string private_key_to_compressed_address(const BIGNUM* private_key) {
     return address;
 }
 
-// 工作线程函数
-void worker_thread(int thread_id, int total_threads) {
-    std::random_device rd;
-    std::mt19937_64 gen(rd());
-    std::uniform_int_distribution<uint64_t> dis(MIN_KEY, MAX_KEY - 1);
+// 生成指定范围内的随机私钥
+void generate_private_key_in_range(BIGNUM* result, const BIGNUM* min_key, const BIGNUM* max_key, BN_CTX* ctx) {
+    BIGNUM* range = BN_new();
+    BIGNUM* temp = BN_new();
     
+    // 计算范围: range = max_key - min_key
+    BN_sub(range, max_key, min_key);
+    
+    // 生成随机数
+    BN_rand_range(temp, range);
+    
+    // 结果 = min_key + 随机数
+    BN_add(result, min_key, temp);
+    
+    BN_free(range);
+    BN_free(temp);
+}
+
+// 工作线程函数
+void worker_thread(int thread_id, int total_threads, const BIGNUM* min_key, const BIGNUM* max_key) {
     // 创建OpenSSL BN上下文
     BN_CTX* ctx = BN_CTX_new();
     BIGNUM* private_key = BN_new();
@@ -177,9 +192,8 @@ void worker_thread(int thread_id, int total_threads) {
     auto last_report_time = std::chrono::steady_clock::now();
     
     while (!found) {
-        // 生成随机私钥
-        uint64_t random_key = dis(gen);
-        BN_set_word(private_key, random_key);
+        // 生成范围内的随机私钥
+        generate_private_key_in_range(private_key, min_key, max_key, ctx);
         
         // 生成地址
         std::string address = private_key_to_compressed_address(private_key);
@@ -268,6 +282,14 @@ int main() {
     // 初始化OpenSSL
     OpenSSL_add_all_algorithms();
     
+    // 创建范围边界
+    BIGNUM* min_key = BN_new();
+    BIGNUM* max_key = BN_new();
+    
+    // 使用字符串初始化大数
+    BN_dec2bn(&min_key, MIN_KEY_STR);
+    BN_dec2bn(&max_key, MAX_KEY_STR);
+    
     // 确定线程数
     int num_threads = std::thread::hardware_concurrency();
     if (num_threads == 0) num_threads = 4; // 默认4线程
@@ -281,7 +303,7 @@ int main() {
     // 启动工作线程
     std::vector<std::thread> worker_threads;
     for (int i = 0; i < num_threads; i++) {
-        worker_threads.emplace_back(worker_thread, i, num_threads);
+        worker_threads.emplace_back(worker_thread, i, num_threads, min_key, max_key);
     }
     
     // 等待工作线程完成
@@ -289,7 +311,7 @@ int main() {
         thread.join();
     }
     
-    // 等待监控线程完成
+// 等待监控线程完成
     monitor_thread.join();
     
     auto end_time = std::chrono::steady_clock::now();
@@ -299,6 +321,10 @@ int main() {
     std::cout << "总运行时间: " << total_seconds << " 秒" << std::endl;
     std::cout << "总检查密钥数: " << keys_checked.load() << std::endl;
     std::cout << "平均速度: " << keys_checked.load() / total_seconds << " 密钥/秒" << std::endl;
+    
+    // 清理内存
+    BN_free(min_key);
+    BN_free(max_key);
     
     // 清理OpenSSL
     EVP_cleanup();
