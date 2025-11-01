@@ -1,3 +1,4 @@
+# 此程序为顺序搜索模式
 import sys
 from bit import Key
 import time
