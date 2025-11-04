@@ -18,9 +18,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# 全局变量，用于跟踪已检查的密钥（跨进程）
-checked_keys_manager = None
-
 class CheckedKeysManager:
     """管理已检查的密钥，避免重复检查"""
     def __init__(self):
@@ -33,21 +30,38 @@ class CheckedKeysManager:
     
     def add_key(self, hex_key):
         """添加已检查的密钥"""
-        with self.lock:
-            with open(self.checked_keys_file, 'a') as f:
-                f.write(f"{hex_key}\n")
+        try:
+            with self.lock:
+                with open(self.checked_keys_file, 'a') as f:
+                    f.write(f"{hex_key}\n")
+            return True
+        except Exception as e:
+            logger.error(f"添加密钥到记录文件失败: {e}")
+            return False
     
     def is_checked(self, hex_key):
         """检查密钥是否已被检查过"""
-        with self.lock:
-            if not os.path.exists(self.checked_keys_file):
+        try:
+            with self.lock:
+                if not os.path.exists(self.checked_keys_file):
+                    return False
+                    
+                with open(self.checked_keys_file, 'r') as f:
+                    for line in f:
+                        if line.strip() == hex_key:
+                            return True
                 return False
-                
-            with open(self.checked_keys_file, 'r') as f:
-                for line in f:
-                    if line.strip() == hex_key:
-                        return True
+        except Exception as e:
+            logger.error(f"检查密钥记录失败: {e}")
             return False
+
+# 全局变量，用于跟踪已检查的密钥（跨进程）
+checked_keys_manager = None
+
+def init_checked_keys_manager():
+    """初始化已检查密钥管理器"""
+    global checked_keys_manager
+    checked_keys_manager = CheckedKeysManager()
 
 def process_range(args):
     """处理指定范围的私钥搜索"""
@@ -73,11 +87,12 @@ def process_range(args):
             hex_string = hex(random_num)[2:].upper().zfill(64)
             
             # 检查这个密钥是否已经被其他进程检查过
-            if checked_keys_manager.is_checked(hex_string):
+            if checked_keys_manager and checked_keys_manager.is_checked(hex_string):
                 continue  # 跳过已检查的密钥
             
             # 标记这个密钥为已检查
-            checked_keys_manager.add_key(hex_string)
+            if checked_keys_manager:
+                checked_keys_manager.add_key(hex_string)
             
             # 检查密钥
             result = check_key(hex_string, WINNING_ADDRESS, process_id, keys_checked)
@@ -128,7 +143,7 @@ def check_key(hex_string, target_address, process_id, keys_checked):
         my_key = Key.from_hex(hex_string)
         
         # 检查是否匹配目标地址
-        if my_key.address == target_address:
+        if my_key and my_key.address == target_address:
             logger.critical(f"🎉 找到匹配的获胜者!!! 进程: {process_id}")
             logger.critical(f"获胜私钥: {my_key}")
             logger.critical(f"匹配地址: {my_key.address}")
@@ -167,12 +182,7 @@ def check_key(hex_string, target_address, process_id, keys_checked):
 
 def main():
     """主函数"""
-    global checked_keys_manager
-    
     logger.info("🚀 启动比特币私钥搜索程序")
-    
-    # 初始化已检查密钥管理器
-    checked_keys_manager = CheckedKeysManager()
     
     # 搜索配置
     first = int('970436974004923190478', 10)  # 起始值
@@ -194,14 +204,20 @@ def main():
     logger.info("开始并行搜索...")
     start_time = time.time()
     
+    # 初始化已检查密钥管理器
+    init_checked_keys_manager()
+    
     # 使用进程池并行处理
-    with multiprocessing.Pool(processes=num_processes) as pool:
+    with multiprocessing.Pool(processes=num_processes, initializer=init_checked_keys_manager) as pool:
         try:
             results = pool.map(process_range, tasks)
         except KeyboardInterrupt:
             logger.info("收到中断信号，正在停止所有进程...")
             pool.terminate()
             pool.join()
+            return
+        except Exception as e:
+            logger.error(f"进程池发生错误: {e}")
             return
     
     # 分析结果
@@ -210,13 +226,14 @@ def main():
     completed_processes = 0
     
     for result in results:
-        if result and result['status'] == 'success':
-            logger.critical("🎊 搜索成功完成！找到获胜私钥！")
-            logger.critical(f"私钥: {result['private_key']}")
-            logger.critical(f"地址: {result['address']}")
-        elif result and result['status'] == 'completed':
-            completed_processes += 1
-            total_keys += result['keys_checked']
+        if result and 'status' in result:
+            if result['status'] == 'success':
+                logger.critical("🎊 搜索成功完成！找到获胜私钥！")
+                logger.critical(f"私钥: {result.get('private_key', '未知')}")
+                logger.critical(f"地址: {result.get('address', '未知')}")
+            elif result['status'] == 'completed':
+                completed_processes += 1
+                total_keys += result.get('keys_checked', 0)
     
     logger.info(f"搜索总结:")
     logger.info(f"总运行时间: {total_time/3600:.2f} 小时")
@@ -237,13 +254,13 @@ def main():
             f.write(f"平均速度: {total_keys/total_time:,.0f} 密钥/秒\n")
         
         # 检查是否有获胜者
-        winners = [r for r in results if r and r['status'] == 'success']
+        winners = [r for r in results if r and 'status' in r and r['status'] == 'success']
         if winners:
             f.write(f"\n🎉 找到 {len(winners)} 个获胜者！\n")
             for winner in winners:
-                f.write(f"进程 {winner['process_id']}:\n")
-                f.write(f"  私钥: {winner['private_key']}\n")
-                f.write(f"  地址: {winner['address']}\n")
+                f.write(f"进程 {winner.get('process_id', '未知')}:\n")
+                f.write(f"  私钥: {winner.get('private_key', '未知')}\n")
+                f.write(f"  地址: {winner.get('address', '未知')}\n")
         else:
             f.write(f"\n未找到匹配的私钥。\n")
 
