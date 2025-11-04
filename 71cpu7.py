@@ -18,56 +18,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-class CheckedKeysManager:
-    """管理已检查的密钥，避免重复检查"""
-    def __init__(self):
-        self.lock = multiprocessing.Lock()
-        self.checked_keys_file = "checked_keys.txt"
-        # 初始化文件
-        if not os.path.exists(self.checked_keys_file):
-            with open(self.checked_keys_file, 'w') as f:
-                f.write("# 已检查的私钥记录\n")
-    
-    def add_key(self, hex_key):
-        """添加已检查的密钥"""
-        try:
-            with self.lock:
-                with open(self.checked_keys_file, 'a') as f:
-                    f.write(f"{hex_key}\n")
-            return True
-        except Exception as e:
-            logger.error(f"添加密钥到记录文件失败: {e}")
-            return False
-    
-    def is_checked(self, hex_key):
-        """检查密钥是否已被检查过"""
-        try:
-            with self.lock:
-                if not os.path.exists(self.checked_keys_file):
-                    return False
-                    
-                with open(self.checked_keys_file, 'r') as f:
-                    for line in f:
-                        if line.strip() == hex_key:
-                            return True
-                return False
-        except Exception as e:
-            logger.error(f"检查密钥记录失败: {e}")
-            return False
-
-# 全局变量，用于跟踪已检查的密钥（跨进程）
-checked_keys_manager = None
-
-def init_checked_keys_manager():
-    """初始化已检查密钥管理器"""
-    global checked_keys_manager
-    checked_keys_manager = CheckedKeysManager()
-
 def process_range(args):
     """处理指定范围的私钥搜索"""
     first, last, process_id = args
     
-    logger.info(f"进程 {process_id} 开始 | 范围: {hex(first)} - {hex(last)}")
+    logger.info(f"进程 {process_id} 开始 | 范围: {hex(first)} - {hex(last)} | 大小: {(last - first + 1):,} 密钥")
     
     # 目标比特币地址
     WINNING_ADDRESS = '19YZECXj3SxEZMoUeJ1yiPsw8xANe7M7QR'
@@ -86,14 +41,6 @@ def process_range(args):
             random_num = first + secrets.randbelow(range_size + 1)
             hex_string = hex(random_num)[2:].upper().zfill(64)
             
-            # 检查这个密钥是否已经被其他进程检查过
-            if checked_keys_manager and checked_keys_manager.is_checked(hex_string):
-                continue  # 跳过已检查的密钥
-            
-            # 标记这个密钥为已检查
-            if checked_keys_manager:
-                checked_keys_manager.add_key(hex_string)
-            
             # 检查密钥
             result = check_key(hex_string, WINNING_ADDRESS, process_id, keys_checked)
             keys_checked += 1
@@ -108,9 +55,13 @@ def process_range(args):
                     elapsed = current_time - start_time
                     keys_per_sec = keys_checked / elapsed if elapsed > 0 else 0
                     
+                    # 计算进度百分比
+                    progress = (keys_checked / (range_size + 1)) * 100 if range_size > 0 else 0
+                    
                     logger.info(
                         f"进程 {process_id} 进度: {keys_checked:,} 密钥检查完毕 | "
                         f"速度: {keys_per_sec:,.0f} 密钥/秒 | "
+                        f"进度: {progress:.6f}% | "
                         f"运行时间: {elapsed/3600:.1f} 小时"
                     )
                     last_log_time = current_time
@@ -180,6 +131,41 @@ def check_key(hex_string, target_address, process_id, keys_checked):
     
     return None
 
+def split_range_into_parts(first, last, num_parts):
+    """将范围分割成多个不重复的部分"""
+    # 计算总范围大小
+    total_range = last - first + 1
+    
+    # 计算每个部分的大小
+    part_size = total_range // num_parts
+    
+    parts = []
+    for i in range(num_parts):
+        # 计算当前部分的起始和结束
+        part_first = first + (i * part_size)
+        
+        # 如果不是最后一部分，结束点是起始点+部分大小-1
+        if i < num_parts - 1:
+            part_last = part_first + part_size - 1
+        else:
+            # 最后一部分包含所有剩余的值
+            part_last = last
+            
+        parts.append((part_first, part_last))
+    
+    return parts
+
+def verify_no_overlap(parts):
+    """验证分割的部分没有重叠"""
+    for i in range(len(parts) - 1):
+        current_last = parts[i][1]
+        next_first = parts[i+1][0]
+        
+        if current_last >= next_first:
+            return False, f"部分 {i} 和 {i+1} 重叠: {hex(current_last)} >= {hex(next_first)}"
+    
+    return True, "所有部分都没有重叠"
+
 def main():
     """主函数"""
     logger.info("🚀 启动比特币私钥搜索程序")
@@ -191,24 +177,38 @@ def main():
     # 设置进程数量
     num_processes = 120
     
-    logger.info(f"搜索范围: {hex(first)} - {hex(last)}")
+    logger.info(f"总搜索范围: {hex(first)} - {hex(last)}")
     logger.info(f"总密钥数: {(last - first + 1):,}")
     logger.info(f"启动进程数: {num_processes}")
     
-    # 创建任务列表 - 所有进程使用相同的范围
+    # 将范围分割成多个不重复的部分
+    parts = split_range_into_parts(first, last, num_processes)
+    
+    # 验证分割没有重叠
+    no_overlap, message = verify_no_overlap(parts)
+    if not no_overlap:
+        logger.error(f"范围分割错误: {message}")
+        return
+    
+    logger.info("范围分割验证通过，没有重叠部分")
+    
+    # 创建任务列表 - 每个进程分配不同的范围
     tasks = []
-    for i in range(num_processes):
-        tasks.append((first, last, i + 1))
-        logger.info(f"进程 {i+1:3d}: 范围随机模式 - {hex(first)} - {hex(last)}")
+    for i, (part_first, part_last) in enumerate(parts):
+        tasks.append((part_first, part_last, i + 1))
+        part_size = part_last - part_first + 1
+        logger.info(f"进程 {i+1:3d}: 分配范围 {hex(part_first)} - {hex(part_last)} "
+                   f"(约 {part_size:,} 个密钥)")
+    
+    # 计算总覆盖范围
+    total_covered = sum(part_last - part_first + 1 for part_first, part_last in parts)
+    logger.info(f"总覆盖密钥数: {total_covered:,} (预期: {(last - first + 1):,})")
     
     logger.info("开始并行搜索...")
     start_time = time.time()
     
-    # 初始化已检查密钥管理器
-    init_checked_keys_manager()
-    
     # 使用进程池并行处理
-    with multiprocessing.Pool(processes=num_processes, initializer=init_checked_keys_manager) as pool:
+    with multiprocessing.Pool(processes=num_processes) as pool:
         try:
             results = pool.map(process_range, tasks)
         except KeyboardInterrupt:
