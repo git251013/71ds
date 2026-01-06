@@ -3,124 +3,138 @@ import hashlib
 import ecdsa
 import base58
 import multiprocessing as mp
-from typing import Tuple, Optional
+from typing import Tuple
+import time
 
-# 目标地址（注意：这个地址极大概率没有对应的已知私钥）
-TARGET_ADDRESS = "1PWo3JeB9jrGwfHDNpdG54CRas7fsVzXU"
+# 目标地址（请确认这是你自己的测试地址！）
+TARGET_ADDRESS = "1PWo3JeB9jrGwfHDNpdGK54CRas7fsVzXU"
 
 def private_key_to_wif(private_key_hex: str) -> str:
-    """将私钥转换为 WIF 格式"""
-    # 添加前缀 0x80 (主网)
-    extended_key = "80" + private_key_hex
-    # 计算校验和
-    first_sha256 = hashlib.sha256(bytes.fromhex(extended_key)).hexdigest()
-    second_sha256 = hashlib.sha256(bytes.fromhex(first_sha256)).hexdigest()
-    checksum = second_sha256[:8]
-    # 组合并编码
-    wif_key = extended_key + checksum
-    return base58.b58encode(bytes.fromhex(wif_key)).decode()
+    """HEX私钥转WIF格式"""
+    extended = "80" + private_key_hex
+    checksum = hashlib.sha256(hashlib.sha256(bytes.fromhex(extended)).digest()).hexdigest()[:8]
+    return base58.b58encode(bytes.fromhex(extended + checksum)).decode()
 
 def private_key_to_address(private_key_hex: str) -> str:
-    """将私钥转换为比特币地址"""
-    # 私钥转字节
-    private_key_bytes = bytes.fromhex(private_key_hex)
+    """生成比特币地址（压缩公钥）"""
+    sk = ecdsa.SigningKey.from_string(bytes.fromhex(private_key_hex), curve=ecdsa.SECP256k1)
+    vk = sk.verifying_key
     
-    # 使用 secp256k1 曲线生成公钥
-    sk = ecdsa.SigningKey.from_string(private_key_bytes, curve=ecdsa.SECP256k1)
-    vk = sk.get_verifying_key()
+    # 压缩公钥
+    pubkey = b'\x02' + vk.pubkey.point.x().to_bytes(32, 'big')
     
-    # 压缩公钥（以 02 或 03 开头）
-    public_key = b'\x02' + vk.pubkey.point.x().to_bytes(32, 'big')
-    
-    # SHA256 -> RIPEMD160
-    sha256_hash = hashlib.sha256(public_key).digest()
-    ripemd160_hash = hashlib.new('ripemd160', sha256_hash).digest()
-    
-    # 添加版本字节 (0x00 for mainnet)
-    versioned_payload = b'\x00' + ripemd160_hash
-    
-    # 双 SHA256 校验和
-    checksum = hashlib.sha256(hashlib.sha256(versioned_payload).digest()).digest()[:4]
-    
-    # Base58 编码
-    address_bytes = versioned_payload + checksum
-    return base58.b58encode(address_bytes).decode()
+    # 地址生成流程
+    ripemd160 = hashlib.new('ripemd160', hashlib.sha256(pubkey).digest()).digest()
+    payload = b'\x00' + ripemd160
+    address = base58.b58encode(payload + hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4])
+    return address.decode()
 
-def worker(start: int, end: int, result_queue: mp.Queue) -> None:
-    """工作进程：在指定范围内搜索"""
-    print(f"进程 {os.getpid()} 开始搜索范围: {hex(start)} - {hex(end)}")
+def worker(start: int, end: int, mode: str, progress_interval: int = 1000):
+    """
+    工作进程
+    :param start: 起始私钥（整数）
+    :param end: 结束私钥（整数）
+    :param mode: 'hex' 或 'wif'
+    :param progress_interval: 每多少次输出进度
+    """
+    pid = os.getpid()
+    print(f"[进程 {pid}] 开始搜索: {hex(start)} → {hex(end)} ({mode}模式)")
     
     for i in range(start, end):
-        # 转换为 64 位十六进制（补零到 64 字符）
-        private_key_hex = format(i, '064x')
+        private_key_hex = format(i, '064x')  # 补零到64位
         
-        # 生成地址
-        address = private_key_to_address(private_key_hex)
-        
-        if address == TARGET_ADDRESS:
-            wif = private_key_to_wif(private_key_hex)
-            result_queue.put((private_key_hex, wif, address))
-            print(f"🎉 找到了！私钥: {private_key_hex}")
-            return
-        
-        # 每处理一定数量显示进度（可选）
-        if i % 100000 == 0:
-            print(f"进程 {os.getpid()}: 已处理 {i - start} 个密钥")
+        try:
+            address = private_key_to_address(private_key_hex)
+            
+            # 输出进度（每progress_interval次）
+            if (i - start) % progress_interval == 0:
+                if mode == 'hex':
+                    print(f"[{pid}] HEX: {private_key_hex} → {address}")
+                else:  # wif模式
+                    wif = private_key_to_wif(private_key_hex)
+                    print(f"[{pid}] WIF: {wif} → {address}")
+            
+            # 检查是否匹配
+            if address == TARGET_ADDRESS:
+                if mode == 'hex':
+                    result = f"🎉 找到匹配! HEX私钥: {private_key_hex}"
+                else:
+                    wif = private_key_to_wif(private_key_hex)
+                    result = f"🎉 找到匹配! WIF私钥: {wif}"
+                
+                print(f"\n{result}\n地址: {address}")
+                return True
+                
+        except Exception as e:
+            print(f"[{pid}] 错误: {e}")
+            continue
+    
+    print(f"[进程 {pid}] 完成搜索，未找到匹配")
+    return False
 
 def main():
-    # 安装依赖提示
+    # 依赖检查
     try:
-        import ecdsa
-        import base58
+        import ecdsa, base58
     except ImportError:
-        print("请先安装依赖: pip install ecdsa base58")
+        print("请安装依赖: pip install ecdsa base58")
         return
-    
-    print("⚠️  警告：比特币地址碰撞在计算上不可行")
+
+    print("="*60)
+    print("⚠️  比特币地址碰撞演示 (仅用于学习!)")
     print(f"目标地址: {TARGET_ADDRESS}")
-    print("这只是一个教学演示，实际无法在合理时间内找到结果\n")
+    print("注意：实际成功概率几乎为0，请勿用于非法用途")
+    print("="*60)
     
-    # 设置搜索范围（示例：只搜索很小的范围）
-    START_RANGE = 0x10000000000000000000000000000000000000000000004eabce0170f4d1dad0
-    END_RANGE = 0x10000000000000000000000000000000000000000000004eabce0170f4d1dadf
+    # 配置参数（示例范围非常小，仅用于演示）
+    START_HEX = "0000000000000000000000000000000000000000000000000000000000000001"
+    END_HEX   = "0000000000000000000000000000000000000000000000000000000000000010"
     
-    # 计算范围大小
-    total_range = END_RANGE - START_RANGE
-    num_processes = min(mp.cpu_count(), 4)  # 限制进程数
-    chunk_size = total_range // num_processes
+    start_int = int(START_HEX, 16)
+    end_int = int(END_HEX, 16)
     
-    print(f"搜索范围: {hex(START_RANGE)} - {hex(END_RANGE)}")
-    print(f"总密钥数: {total_range:,}")
-    print(f"使用进程数: {num_processes}\n")
+    # 选择模式
+    mode = input("\n选择搜索模式 (输入 hex 或 wif): ").strip().lower()
+    if mode not in ['hex', 'wif']:
+        print("无效模式，默认使用 hex")
+        mode = 'hex'
     
-    # 创建结果队列
-    result_queue = mp.Queue()
-    processes = []
+    # 多进程配置
+    num_processes = min(mp.cpu_count(), 4)
+    total_range = end_int - start_int
+    chunk_size = max(1, total_range // num_processes)
+    
+    print(f"\n配置:")
+    print(f"- 搜索范围: {START_HEX} → {END_HEX}")
+    print(f"- 总私钥数: {total_range:,}")
+    print(f"- 进程数: {num_processes}")
+    print(f"- 模式: {mode.upper()}")
+    print("-"*40)
     
     # 启动进程
+    processes = []
+    start_time = time.time()
+    
     for i in range(num_processes):
-        start = START_RANGE + i * chunk_size
-        end = START_RANGE + (i + 1) * chunk_size if i < num_processes - 1 else END_RANGE
+        proc_start = start_int + i * chunk_size
+        proc_end = min(start_int + (i+1) * chunk_size, end_int)
         
-        p = mp.Process(target=worker, args=(start, end, result_queue))
+        if proc_start >= proc_end:
+            break
+            
+        p = mp.Process(
+            target=worker, 
+            args=(proc_start, proc_end, mode)
+        )
         processes.append(p)
         p.start()
     
-    # 等待结果或所有进程结束
-    found = False
+    # 等待完成
     for p in processes:
         p.join()
-        if not result_queue.empty():
-            private_key, wif, address = result_queue.get()
-            print(f"\n✅ 成功找到匹配！")
-            print(f"私钥 (HEX): {private_key}")
-            print(f"私钥 (WIF): {wif}")
-            print(f"地址: {address}")
-            found = True
-            break
     
-    if not found:
-        print("\n❌ 在指定范围内未找到匹配的私钥")
+    elapsed = time.time() - start_time
+    print(f"\n🏁 所有进程完成! 耗时: {elapsed:.2f}秒")
 
 if __name__ == "__main__":
     main()
