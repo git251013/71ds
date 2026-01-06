@@ -7,7 +7,7 @@ from typing import Tuple
 import time
 
 # 目标地址（请确认这是你自己的测试地址！）
-TARGET_ADDRESS = "1PWo3JeB9jrGwfHDNpdGK54CRas7fsVzXU"
+TARGET_ADDRESS = "1PWo3JeB"
 
 def private_key_to_wif(private_key_hex: str) -> str:
     """HEX私钥转WIF格式（修复压缩标志位）"""
@@ -16,19 +16,29 @@ def private_key_to_wif(private_key_hex: str) -> str:
     return base58.b58encode(bytes.fromhex(extended + checksum)).decode()
 
 def private_key_to_address(private_key_hex: str) -> str:
-    """生成比特币地址（修复压缩公钥处理）"""
+    """生成比特币地址（正确处理压缩公钥）"""
     sk = ecdsa.SigningKey.from_string(bytes.fromhex(private_key_hex), curve=ecdsa.SECP256k1)
     vk = sk.verifying_key
     
-    # 正确的压缩公钥格式
-    x = vk.pubkey.point.x().to_bytes(32, 'big')
-    y = vk.pubkey.point.y().to_bytes(32, 'big')
-    pubkey = b'\x02' + x if int.from_bytes(y, 'big') % 2 == 0 else b'\x03' + x
+    # 获取原始公钥数据（64字节：x + y）
+    pubkey_raw = vk.to_string()
     
-    # 标准地址生成流程
-    sha256 = hashlib.sha256(pubkey).digest()
+    # 确保公钥长度正确
+    if len(pubkey_raw) != 64:
+        raise ValueError(f"Invalid public key length: {len(pubkey_raw)} bytes")
+    
+    # 提取x和y坐标（各32字节）
+    x = pubkey_raw[:32]
+    y = pubkey_raw[32:]
+    
+    # 根据y坐标的奇偶性确定压缩公钥前缀
+    prefix = b'\x02' if y[-1] % 2 == 0 else b'\x03'
+    compressed_pubkey = prefix + x
+    
+    # 标准比特币地址生成流程（P2PKH）
+    sha256 = hashlib.sha256(compressed_pubkey).digest()
     ripemd160 = hashlib.new('ripemd160', sha256).digest()
-    payload = b'\x00' + ripemd160
+    payload = b'\x00' + ripemd160  # 0x00 表示 mainnet P2PKH
     checksum = hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4]
     address = base58.b58encode(payload + checksum)
     return address.decode()
@@ -54,7 +64,7 @@ def worker(start: int, end: int, mode: str, progress_interval: int = 1000):
         try:
             address = private_key_to_address(private_key_hex)
             
-            # 验证地址匹配（关键修复）
+            # 验证地址匹配
             if address == TARGET_ADDRESS:
                 if verify_address_match(private_key_hex, TARGET_ADDRESS):
                     if mode == 'hex':
@@ -98,8 +108,8 @@ def main():
     print("="*60)
     
     # 配置参数
-    START_HEX = "0000000000000000000000000000000000000000000000000000000000000001"
-    END_HEX   = "0000000000000000000000000000000000000000000000000000000000000010"
+    START_HEX = "00000000000000000000000000000000000000000000004eabce0170f4d1dad0"
+    END_HEX   = "00000000000000000000000000000000000000000000004eabce0170f4d1daff"
     
     start_int = int(START_HEX, 16)
     end_int = int(END_HEX, 16)
@@ -148,4 +158,23 @@ def main():
     print(f"\n🏁 所有进程完成! 耗时: {elapsed:.2f}秒")
 
 if __name__ == "__main__":
+    # 添加测试用例以验证地址生成函数
+    test_priv = "18E14A7B6A307F426A94F8114701E7C8E774E7F9A47E2C2035DB29A206321725"
+    expected_addr = "16UwLL9Risc3QfPqBUvKofHmBQ7wMtjvM"
+    generated_addr = private_key_to_address(test_priv)
+    
+    print(f"\n{'='*30} 测试验证 {'='*30}")
+    print(f"测试私钥: {test_priv}")
+    print(f"预期地址: {expected_addr}")
+    print(f"生成地址: {generated_addr}")
+    
+    if generated_addr == expected_addr:
+        print("✅ 地址生成函数测试通过!")
+    else:
+        print("❌ 地址生成函数测试失败!")
+        print("请检查 ecdsa 库版本或实现逻辑")
+    
+    print(f"{'='*60}\n")
+    
+    # 运行主程序
     main()
