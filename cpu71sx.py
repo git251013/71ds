@@ -10,28 +10,36 @@ import time
 TARGET_ADDRESS = "1PWo3JeB9jrGwfHDNpdGK54CRas7fsVzXU"
 
 def private_key_to_wif(private_key_hex: str) -> str:
-    """HEX私钥转WIF格式"""
-    extended = "80" + private_key_hex
+    """HEX私钥转WIF格式（修复压缩标志位）"""
+    extended = "80" + private_key_hex + "01"  # 添加压缩标志位
     checksum = hashlib.sha256(hashlib.sha256(bytes.fromhex(extended)).digest()).hexdigest()[:8]
     return base58.b58encode(bytes.fromhex(extended + checksum)).decode()
 
 def private_key_to_address(private_key_hex: str) -> str:
-    """生成比特币地址（压缩公钥）"""
+    """生成比特币地址（修复压缩公钥处理）"""
     sk = ecdsa.SigningKey.from_string(bytes.fromhex(private_key_hex), curve=ecdsa.SECP256k1)
     vk = sk.verifying_key
     
-    # 压缩公钥
-    pubkey = b'\x02' + vk.pubkey.point.x().to_bytes(32, 'big')
+    # 正确的压缩公钥格式
+    x = vk.pubkey.point.x().to_bytes(32, 'big')
+    y = vk.pubkey.point.y().to_bytes(32, 'big')
+    pubkey = b'\x02' + x if int.from_bytes(y, 'big') % 2 == 0 else b'\x03' + x
     
-    # 地址生成流程
-    ripemd160 = hashlib.new('ripemd160', hashlib.sha256(pubkey).digest()).digest()
+    # 标准地址生成流程
+    sha256 = hashlib.sha256(pubkey).digest()
+    ripemd160 = hashlib.new('ripemd160', sha256).digest()
     payload = b'\x00' + ripemd160
-    address = base58.b58encode(payload + hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4])
+    checksum = hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4]
+    address = base58.b58encode(payload + checksum)
     return address.decode()
+
+def verify_address_match(private_key_hex: str, expected_address: str) -> bool:
+    """验证私钥是否生成指定地址"""
+    return private_key_to_address(private_key_hex) == expected_address
 
 def worker(start: int, end: int, mode: str, progress_interval: int = 1000):
     """
-    工作进程
+    工作进程（添加验证逻辑）
     :param start: 起始私钥（整数）
     :param end: 结束私钥（整数）
     :param mode: 'hex' 或 'wif'
@@ -46,25 +54,28 @@ def worker(start: int, end: int, mode: str, progress_interval: int = 1000):
         try:
             address = private_key_to_address(private_key_hex)
             
+            # 验证地址匹配（关键修复）
+            if address == TARGET_ADDRESS:
+                if verify_address_match(private_key_hex, TARGET_ADDRESS):
+                    if mode == 'hex':
+                        result = f"🎉 找到匹配! HEX私钥: {private_key_hex}"
+                    else:
+                        wif = private_key_to_wif(private_key_hex)
+                        result = f"🎉 找到匹配! WIF私钥: {wif}"
+                    
+                    print(f"\n{result}\n地址: {address}")
+                    return True
+                else:
+                    print(f"[{pid}] 警告: 地址匹配但验证失败! {private_key_hex} → {address}")
+            
             # 输出进度（每progress_interval次）
             if (i - start) % progress_interval == 0:
                 if mode == 'hex':
                     print(f"[{pid}] HEX: {private_key_hex} → {address}")
-                else:  # wif模式
+                else:
                     wif = private_key_to_wif(private_key_hex)
                     print(f"[{pid}] WIF: {wif} → {address}")
             
-            # 检查是否匹配
-            if address == TARGET_ADDRESS:
-                if mode == 'hex':
-                    result = f"🎉 找到匹配! HEX私钥: {private_key_hex}"
-                else:
-                    wif = private_key_to_wif(private_key_hex)
-                    result = f"🎉 找到匹配! WIF私钥: {wif}"
-                
-                print(f"\n{result}\n地址: {address}")
-                return True
-                
         except Exception as e:
             print(f"[{pid}] 错误: {e}")
             continue
@@ -86,7 +97,7 @@ def main():
     print("注意：实际成功概率几乎为0，请勿用于非法用途")
     print("="*60)
     
-    # 配置参数（示例范围非常小，仅用于演示）
+    # 配置参数
     START_HEX = "0000000000000000000000000000000000000000000000000000000000000001"
     END_HEX   = "0000000000000000000000000000000000000000000000000000000000000010"
     
